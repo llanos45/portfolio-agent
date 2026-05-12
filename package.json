@@ -1,0 +1,17 @@
+{
+  "name": "portfolio-agent",
+  "version": "1.0.0",
+  "description": "Agente de análisis de cartera personal con informes automáticos por email",
+  "main": "agent.js",
+  "scripts": {
+    "start": "node agent.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "node-cron": "^3.0.3",
+    "resend": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
