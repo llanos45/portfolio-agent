@@ -261,6 +261,6 @@ console.log("  · Viernes 20:00h → Revisión Semanal");
 console.log("  · Mar/Jue 9:00h → Verificación Earnings");
 
 // Para test manual: descomenta la línea que quieras probar
- runMonday();
+// runMonday();
 // runFriday();
 // checkEarningsAlert();
