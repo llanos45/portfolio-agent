@@ -433,11 +433,19 @@ cron.schedule("0 7 * * 2,4", () => safeRun(earningsAlert, "earningsAlert"), { ti
 // Uso: node agent.js test-radar | test-review | test-earnings | test-watchlist
 // ============================================================
 
-const arg = process.argv[2];
+// ============================================================
+// ARRANQUE: test por argumento CLI o por variable de entorno
+// En Railway: añade variable RUN_ON_START=test-review en Variables
+// En local:   node agent.js test-review
+// ============================================================
+
+const arg = process.argv[2] || process.env.RUN_ON_START;
+
 if (arg && arg.startsWith("test-")) {
   const type = arg.replace("test-", "");
-  runManualTest(type);
+  // Esperar 2s a que el servidor HTTP arranque antes de lanzar el test
+  setTimeout(() => runManualTest(type), 2000);
 } else {
   console.log("ℹ️  Agente en modo espera. Cron jobs activos.");
-  console.log("💡 Para test manual: node agent.js test-radar | test-review | test-earnings | test-watchlist");
+  console.log("💡 Para test: añade variable RUN_ON_START=test-review en Railway → Variables");
 }
