@@ -1,12 +1,27 @@
 // ============================================================
-// QUALITY GROWTH PORTFOLIO AGENT — v2.0
+// QUALITY GROWTH PORTFOLIO AGENT — v2.1
 // Autor: Generado para cartera personal Quality Growth
 // Stack: Node.js + Anthropic API + Resend + Railway
+// Fixes v2.1: HTTP keepalive server + retry automático + timeout
 // ============================================================
 
 import Anthropic from "@anthropic-ai/sdk";
 import { Resend } from "resend";
 import * as cron from "node-cron";
+import http from "http";
+
+// ============================================================
+// SERVIDOR HTTP KEEPALIVE — impide que Railway mate el proceso
+// Railway necesita un servidor HTTP activo o mata el contenedor
+// ============================================================
+
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Quality Growth Agent v2.1 — OK");
+}).listen(PORT, () => {
+  console.log(`🌐 Keepalive server escuchando en puerto ${PORT}`);
+});
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const resend = new Resend(process.env.RESEND_API_KEY);
@@ -118,28 +133,52 @@ ${WATCHLIST.map(w => `- ${w.ticker} (${w.name}): Score QG ${w.qualityScore}/10. 
 
 // ============================================================
 // FUNCIÓN PRINCIPAL: LLAMADA A CLAUDE CON WEB SEARCH
+// Incluye retry automático (3 intentos) y timeout de 4 minutos
 // ============================================================
 
-async function askClaude(prompt, maxTokens = 1500) {
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: maxTokens,
-    tools: [{ type: "web_search_20250305", name: "web_search" }],
-    system: `Eres un analista de inversiones especializado en Quality Growth investing. 
+async function askClaude(prompt, maxTokens = 1500, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`🤖 Llamando a Claude (intento ${attempt}/${retries})...`);
+
+      // Timeout de 4 minutos — Claude con web search puede tardar ~60-90s
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Claude timeout (240s)")), 240000)
+      );
+
+      const claudePromise = anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: maxTokens,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        system: `Eres un analista de inversiones especializado en Quality Growth investing. 
 Analizas carteras basándote en los principios de Peter Seilern. 
 Respondes siempre en español, de forma directa y accionable. 
 Sin disclaimers legales excesivos. El inversor tiene perfil de largo plazo y tolerancia alta al riesgo.
 Formato de respuesta: HTML limpio para email (sin CSS externo, solo inline styles básicos).`,
-    messages: [{ role: "user", content: prompt }],
-  });
+        messages: [{ role: "user", content: prompt }],
+      });
 
-  // Extraer texto de bloques de contenido (puede incluir tool_use de web_search)
-  const textBlocks = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
+      const response = await Promise.race([claudePromise, timeoutPromise]);
 
-  return textBlocks;
+      // Extraer texto de bloques de contenido (puede incluir tool_use de web_search)
+      const textBlocks = response.content
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("\n");
+
+      console.log(`✅ Claude respondió correctamente (intento ${attempt})`);
+      return textBlocks;
+
+    } catch (error) {
+      console.error(`❌ Error en intento ${attempt}/${retries}: ${error.message}`);
+      if (attempt === retries) {
+        throw new Error(`Claude falló tras ${retries} intentos: ${error.message}`);
+      }
+      // Esperar 15s antes del siguiente intento
+      console.log(`⏳ Esperando 15s antes de reintentar...`);
+      await new Promise(resolve => setTimeout(resolve, 15000));
+    }
+  }
 }
 
 // ============================================================
@@ -364,21 +403,30 @@ async function runManualTest(type = "radar") {
 // Martes/Jueves 9:00 Madrid = 7:00 UTC → "0 7 * * 2,4"
 // ============================================================
 
-console.log("🚀 Quality Growth Portfolio Agent v2.0 iniciado");
+console.log("🚀 Quality Growth Portfolio Agent v2.1 iniciado");
 console.log(`📧 Informes a: ${RECIPIENT}`);
 console.log("📅 Horario: Lunes 8h (radar) | Viernes 20h (revisión) | Mar+Jue 9h (earnings)");
 
+// Wrapper para capturar errores en cron sin matar el proceso
+async function safeRun(fn, name) {
+  try {
+    await fn();
+  } catch (err) {
+    console.error(`❌ Error en tarea "${name}": ${err.message}`);
+  }
+}
+
 // Radar semanal — lunes 8:00 Madrid
 cron.schedule("0 6 * * 1", async () => {
-  await weeklyRadar();
-  await watchlistOpportunityAlert(); // también revisa watchlist los lunes
+  await safeRun(weeklyRadar, "weeklyRadar");
+  await safeRun(watchlistOpportunityAlert, "watchlistOpportunityAlert");
 }, { timezone: "UTC" });
 
 // Revisión semanal — viernes 20:00 Madrid  
-cron.schedule("0 18 * * 5", weeklyReview, { timezone: "UTC" });
+cron.schedule("0 18 * * 5", () => safeRun(weeklyReview, "weeklyReview"), { timezone: "UTC" });
 
 // Alertas earnings — martes y jueves 9:00 Madrid
-cron.schedule("0 7 * * 2,4", earningsAlert, { timezone: "UTC" });
+cron.schedule("0 7 * * 2,4", () => safeRun(earningsAlert, "earningsAlert"), { timezone: "UTC" });
 
 // ============================================================
 // ARRANQUE: TEST INMEDIATO SI SE PASA ARGUMENTO
