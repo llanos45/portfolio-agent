@@ -147,7 +147,7 @@ async function askClaude(prompt, maxTokens = 1500, retries = 3) {
       );
 
       const claudePromise = anthropic.messages.create({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-4-5",
         max_tokens: maxTokens,
         tools: [{ type: "web_search_20250305", name: "web_search" }],
         system: `Eres un analista de inversiones especializado en Quality Growth investing. 
