@@ -132,8 +132,8 @@ ${WATCHLIST.map(w => `- ${w.ticker} (${w.name}): Score QG ${w.qualityScore}/10. 
 `;
 
 // ============================================================
-// FUNCIÓN PRINCIPAL: LLAMADA A CLAUDE CON WEB SEARCH
-// Incluye retry automático (3 intentos) y timeout de 4 minutos
+// FUNCIÓN PRINCIPAL: LLAMADA A CLAUDE SIN WEB SEARCH
+// (web_search requiere plan API específico — usar conocimiento del modelo)
 // ============================================================
 
 async function askClaude(prompt, maxTokens = 1500, retries = 3) {
@@ -141,7 +141,6 @@ async function askClaude(prompt, maxTokens = 1500, retries = 3) {
     try {
       console.log(`🤖 Llamando a Claude (intento ${attempt}/${retries})...`);
 
-      // Timeout de 4 minutos — Claude con web search puede tardar ~60-90s
       const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error("Claude timeout (240s)")), 240000)
       );
@@ -149,18 +148,17 @@ async function askClaude(prompt, maxTokens = 1500, retries = 3) {
       const claudePromise = anthropic.messages.create({
         model: "claude-sonnet-4-6",
         max_tokens: maxTokens,
-        tools: [{ type: "web_search_20250305", name: "web_search" }],
         system: `Eres un analista de inversiones especializado en Quality Growth investing. 
 Analizas carteras basándote en los principios de Peter Seilern. 
 Respondes siempre en español, de forma directa y accionable. 
 Sin disclaimers legales excesivos. El inversor tiene perfil de largo plazo y tolerancia alta al riesgo.
+Usa tu conocimiento actualizado sobre los mercados y las empresas mencionadas.
 Formato de respuesta: HTML limpio para email (sin CSS externo, solo inline styles básicos).`,
         messages: [{ role: "user", content: prompt }],
       });
 
       const response = await Promise.race([claudePromise, timeoutPromise]);
 
-      // Extraer texto de bloques de contenido (puede incluir tool_use de web_search)
       const textBlocks = response.content
         .filter((block) => block.type === "text")
         .map((block) => block.text)
@@ -174,7 +172,6 @@ Formato de respuesta: HTML limpio para email (sin CSS externo, solo inline style
       if (attempt === retries) {
         throw new Error(`Claude falló tras ${retries} intentos: ${error.message}`);
       }
-      // Esperar 15s antes del siguiente intento
       console.log(`⏳ Esperando 15s antes de reintentar...`);
       await new Promise(resolve => setTimeout(resolve, 15000));
     }
