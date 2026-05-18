@@ -1,13 +1,11 @@
 // ============================================================
-// QUALITY GROWTH PORTFOLIO AGENT — v2.3
-// Fixes v2.3:
-//   - Web search NATIVO activado en todas las llamadas a Claude
-//     → precios y datos en tiempo real, sin alucinaciones
-//   - Watchlist dividida en dos grupos:
-//       GRUPO A: propuestas proactivas del agente (ASML, NVO, ADYEN, V...)
-//       GRUPO B: acciones que el inversor pasa para seguimiento propio
-//   - askClaude() maneja respuestas con bloques server_tool_use
-//   - Bug ´´´html eliminado: instrucción explícita + limpieza defensiva
+// QUALITY GROWTH PORTFOLIO AGENT — v2.4
+// Fix v2.4: rate limit 30k tokens/min resuelto
+//   - Prompts drásticamente reducidos (perfil compacto)
+//   - Llamadas divididas en pasos pequeños secuenciales
+//   - Retry con backoff exponencial (30s, 60s, 120s)
+//   - maxTokens reducido a 1500 por llamada
+//   - Web search activo pero con prompts más cortos
 // ============================================================
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -15,390 +13,249 @@ import { Resend } from "resend";
 import * as cron from "node-cron";
 import http from "http";
 
-// ============================================================
-// SERVIDOR HTTP KEEPALIVE
-// ============================================================
-
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Quality Growth Agent v2.3 — OK");
-}).listen(PORT, () => {
-  console.log(`🌐 Keepalive server escuchando en puerto ${PORT}`);
-});
+  res.end("Quality Growth Agent v2.4 — OK");
+}).listen(PORT, () => console.log(`🌐 Puerto ${PORT} activo`));
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const resend = new Resend(process.env.RESEND_API_KEY);
-
 const RECIPIENT = process.env.RECIPIENT_EMAIL || "i.llanos45@gmail.com";
 const FROM = process.env.FROM_EMAIL || "onboarding@resend.dev";
 
 // ============================================================
-// CARTERA ACTUAL
+// CARTERA
 // ============================================================
 
 const PORTFOLIO = [
-  { ticker: "MC.PA",  name: "LVMH",                 shares: 5.7097,  avgPrice: 569.9,   currency: "EUR" },
-  { ticker: "FICO",   name: "Fair Isaac (FICO)",     shares: 0.3439,  avgPrice: 1020.62, currency: "USD" },
-  { ticker: "AMD",    name: "Advanced Micro Devices",shares: 0.1,     avgPrice: 223.57,  currency: "USD" },
-  { ticker: "MSFT",   name: "Microsoft",             shares: 2.9578,  avgPrice: 379.32,  currency: "USD" },
-  { ticker: "CELH",   name: "Celsius Holdings",      shares: 61.6752, avgPrice: 43.81,   currency: "USD" },
-  { ticker: "GOOGL",  name: "Alphabet",              shares: 19.5725, avgPrice: 150.72,  currency: "USD" },
-  { ticker: "SATL",   name: "Satellogic",            shares: 130,     avgPrice: 3.75,    currency: "USD" },
+  { ticker: "MC.PA", name: "LVMH",       shares: 5.7097,  avg: 569.9,   cur: "€" },
+  { ticker: "FICO",  name: "Fair Isaac",  shares: 0.3439,  avg: 1020.62, cur: "$" },
+  { ticker: "AMD",   name: "AMD",         shares: 0.1,     avg: 223.57,  cur: "$" },
+  { ticker: "MSFT",  name: "Microsoft",   shares: 2.9578,  avg: 379.32,  cur: "$" },
+  { ticker: "CELH",  name: "Celsius",     shares: 61.6752, avg: 43.81,   cur: "$" },
+  { ticker: "GOOGL", name: "Alphabet",    shares: 19.5725, avg: 150.72,  cur: "$" },
+  { ticker: "SATL",  name: "Satellogic",  shares: 130,     avg: 3.75,    cur: "$" },
+];
+
+// GRUPO A — propuestas del agente
+const WATCHLIST_A = [
+  { ticker: "ASML",     name: "ASML Holding",  threshold: 25, cur: "$" },
+  { ticker: "V",        name: "Visa",           threshold: 20, cur: "$" },
+  { ticker: "NVO",      name: "Novo Nordisk",   threshold: 25, cur: "$" },
+  { ticker: "ADYEN.AS", name: "Adyen",          threshold: 30, cur: "€" },
+];
+
+// GRUPO B — seguimiento propio del inversor
+const WATCHLIST_B = [
+  { ticker: "MA",   name: "Mastercard",         threshold: 15, cur: "$" },
+  { ticker: "SPGI", name: "S&P Global",          threshold: 20, cur: "$" },
+  { ticker: "MCO",  name: "Moody's",             threshold: 15, cur: "$" },
+  { ticker: "MELI", name: "MercadoLibre",        threshold: 30, cur: "$" },
+  { ticker: "RACE", name: "Ferrari",             threshold: 30, cur: "$" },
+  { ticker: "ITX",  name: "Inditex",             threshold: 20, cur: "€" },
 ];
 
 // ============================================================
-// WATCHLIST — GRUPO A: PROPUESTAS PROACTIVAS DEL AGENTE
-// El agente busca semanalmente oportunidades en este universo
-// y propone incorporaciones al inversor
+// PERFIL COMPACTO (mínimo tokens posible)
 // ============================================================
 
-const WATCHLIST_AGENT = [
-  {
-    ticker: "ASML",
-    name: "ASML Holding",
-    currency: "USD",
-    qualityScore: 10,
-    targetEntryDiscount: 0.25,
-    entryNotes: "Monopolio absoluto EUV. Única empresa capaz de fabricar litografía EUV en el mundo. Barrera de entrada imposible de replicar. Alerta si cotiza con descuento ≥25% desde máx 52s.",
-  },
-  {
-    ticker: "V",
-    name: "Visa",
-    currency: "USD",
-    qualityScore: 10,
-    targetEntryDiscount: 0.20,
-    entryNotes: "Red de pagos más grande del mundo, capital-light, márgenes >50%. Alerta si descuento ≥20% desde máx 52s.",
-  },
-  {
-    ticker: "NVO",
-    name: "Novo Nordisk",
-    currency: "USD",
-    qualityScore: 9,
-    targetEntryDiscount: 0.25,
-    entryNotes: "Liderazgo GLP-1 en mercado obesidad. Ozempic/Wegovy. Exposición farma/Europa. Alerta si descuento ≥25%.",
-  },
-  {
-    ticker: "ADYEN.AS",
-    name: "Adyen",
-    currency: "EUR",
-    qualityScore: 8,
-    targetEntryDiscount: 0.30,
-    entryNotes: "Fintech pagos superior, infraestructura end-to-end propia. Alerta solo con descuento ≥30%.",
-  },
-];
-
-// ============================================================
-// WATCHLIST — GRUPO B: SEGUIMIENTO PROPIO DEL INVERSOR
-// Acciones que el inversor pasa para estudiar y decidir entrada
-// El agente reporta su estado semanal pero no propone nuevas
-// ============================================================
-
-const WATCHLIST_INVESTOR = [
-  {
-    ticker: "MA",
-    name: "Mastercard",
-    currency: "USD",
-    qualityScore: 10,
-    targetEntryDiscount: 0.15,
-    entryNotes: "Red pagos global asset-light. ~40% ingresos son servicios valor añadido. Cross-border crece doble dígito. Entrada si descuento ≥15% desde máx 52s.",
-  },
-  {
-    ticker: "SPGI",
-    name: "S&P Global",
-    currency: "USD",
-    qualityScore: 10,
-    targetEntryDiscount: 0.20,
-    entryNotes: "Duopolio ratings con Moody's. Dueña del índice S&P 500. Margen operativo ~43%. Entrada si descuento ≥20%.",
-  },
-  {
-    ticker: "MCO",
-    name: "Moody's Corporation",
-    currency: "USD",
-    qualityScore: 10,
-    targetEntryDiscount: 0.15,
-    entryNotes: "Duopolio ratings. Modelos embebidos regulatoriamente, menor riesgo IA. Retention ~97%. Entrada si descuento ≥15%.",
-  },
-  {
-    ticker: "MELI",
-    name: "MercadoLibre",
-    currency: "USD",
-    qualityScore: 9,
-    targetEntryDiscount: 0.30,
-    entryNotes: "Dominador ecommerce latinoamericano. Moat logístico + fintech Mercado Pago. Caída táctica por envío gratis Brasil. Entrada si descuento ≥30%.",
-  },
-  {
-    ticker: "RACE",
-    name: "Ferrari",
-    currency: "USD",
-    qualityScore: 9,
-    targetEntryDiscount: 0.30,
-    entryNotes: "Brand moat inigualable. Lista de espera estructural. Pricing power máximo. Crecimiento más moderado. Entrada si descuento ≥30%.",
-  },
-  {
-    ticker: "ITX",
-    name: "Inditex",
-    currency: "EUR",
-    qualityScore: 9,
-    targetEntryDiscount: 0.20,
-    entryNotes: "Líder mundial fast fashion. Ventaja en velocidad (2-3 semanas diseño→tienda vs 6+ meses industria). Alto ROIC. Entrada si descuento ≥20%.",
-  },
-];
-
-// ============================================================
-// PERFIL DEL INVERSOR
-// ============================================================
-
-const INVESTOR_PROFILE = `
-PERFIL DEL INVERSOR:
-- Filosofía: Quality Growth (Peter Seilern, "Solo los mejores lo logran")
-- Horizonte: 10-20 años, cartera de largo plazo
-- Aportación mensual: 200-300€/mes (julio-diciembre 2026)
-- Aportaciones extra: pagas extra junio/diciembre + variable anual (~2.900€) en Q1
-- Cash reserva: ~3.000€ (no tocar salvo emergencia real)
-- Objetivo adicional: vivienda 400-500k€ en 5-10 años
-- Convicción alta en: CELH (expansión Europa, precio objetivo ~60$), GOOGL (mayor posición)
-- Preocupaciones: concentración GOOGL, recuperación LVMH, posición residual AMD
-
-LAS 10 REGLAS QUALITY GROWTH:
-1. Modelo de negocio escalable
-2. Industrias en crecimiento estructural
-3. Compañías líderes en su sector
-4. Ventaja competitiva sostenible
-5. Fuerte crecimiento orgánico de ventas
-6. Baja concentración de clientes / presencia geográfica diversificada
-7. Baja intensidad de capital y alta ROIC
-8. Balance sólido
-9. Cuentas transparentes
-10. Excelente gestión y gobierno corporativo
-
-CARTERA ACTUAL:
-${PORTFOLIO.map(p => `- ${p.ticker} (${p.name}): ${p.shares} acciones a precio medio ${p.avgPrice}${p.currency === "EUR" ? "€" : "$"}`).join("\n")}
-
-WATCHLIST GRUPO A — PROPUESTAS PROACTIVAS DEL AGENTE:
-${WATCHLIST_AGENT.map(w => `- ${w.ticker} (${w.name}): Score QG ${w.qualityScore}/10. Descuento objetivo: ${w.targetEntryDiscount * 100}%. ${w.entryNotes}`).join("\n")}
-
-WATCHLIST GRUPO B — SEGUIMIENTO PROPIO DEL INVERSOR:
-${WATCHLIST_INVESTOR.map(w => `- ${w.ticker} (${w.name}): Score QG ${w.qualityScore}/10. Descuento objetivo: ${w.targetEntryDiscount * 100}%. ${w.entryNotes}`).join("\n")}
+const PROFILE = `
+Inversor Quality Growth (Seilern). Horizonte 10-20 años. Aportación 200-300€/mes desde jul-2026.
+Cartera: ${PORTFOLIO.map(p => `${p.ticker}@${p.avg}${p.cur}`).join(", ")}.
+Watchlist A (agente): ${WATCHLIST_A.map(w => `${w.ticker}(≥${w.threshold}%desc)`).join(", ")}.
+Watchlist B (inversor): ${WATCHLIST_B.map(w => `${w.ticker}(≥${w.threshold}%desc)`).join(", ")}.
+Reglas: moat sostenible, crecimiento orgánico, ROIC alto, balance sólido, gestión excelente.
 `;
 
-// ============================================================
-// INSTRUCCIÓN ANTI-MARKDOWN
-// ============================================================
-
-const HTML_INSTRUCTION = `
-INSTRUCCIÓN CRÍTICA DE FORMATO:
-- Responde ÚNICAMENTE con HTML puro listo para insertar en el body de un email.
-- NUNCA uses bloques de código markdown. No escribas \`\`\`html ni \`\`\` en ningún momento.
-- NUNCA uses asteriscos (*), almohadillas (#) ni ningún otro marcador markdown.
-- Solo HTML con atributos style inline. Sin clases CSS externas ni hojas de estilo.
-- No incluyas <html>, <head> ni <body>. Solo el contenido interior.
-`;
+const FMT = `FORMATO: Solo HTML puro con inline styles. Sin markdown, sin \`\`\`html, sin asteriscos.`;
 
 // ============================================================
-// LLAMADA A CLAUDE CON WEB SEARCH NATIVO + RETRY
+// CLAUDE CON WEB SEARCH — retry exponencial
 // ============================================================
 
-async function askClaude(prompt, maxTokens = 2500, retries = 3) {
+async function askClaude(prompt, maxTokens = 1500, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      console.log(`🤖 Llamando a Claude con web search (intento ${attempt}/${retries})...`);
+      console.log(`🤖 Claude intento ${attempt}/${retries}...`);
 
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Claude timeout (300s)")), 300000)
+      const timeout = new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("timeout 270s")), 270000)
       );
 
-      const claudePromise = anthropic.messages.create({
+      const call = anthropic.messages.create({
         model: "claude-sonnet-4-6",
         max_tokens: maxTokens,
-        system: `Eres un analista de inversiones especializado en Quality Growth investing.
-Analizas carteras basándote en los principios de Peter Seilern.
-Respondes siempre en español, de forma directa y accionable.
-Sin disclaimers legales excesivos. El inversor tiene perfil de largo plazo y tolerancia alta al riesgo.
-Tienes acceso a búsqueda web en tiempo real — ÚSALA SIEMPRE para obtener precios actuales,
-máximos de 52 semanas y noticias recientes. NUNCA inventes precios ni datos de mercado.
-FORMATO: Responde SIEMPRE en HTML puro con inline styles. NUNCA uses markdown ni \`\`\`html.`,
+        system: `Analista Quality Growth (Seilern). Responde en español, directo y accionable.
+Usa web search para precios reales — NUNCA inventes cotizaciones.
+${FMT}`,
         messages: [{ role: "user", content: prompt }],
-        tools: [
-          {
-            type: "web_search_20260209",
-            name: "web_search",
-          }
-        ],
+        tools: [{ type: "web_search_20260209", name: "web_search" }],
       });
 
-      const response = await Promise.race([claudePromise, timeoutPromise]);
+      const res = await Promise.race([call, timeout]);
 
-      // Extraer solo bloques de texto final (ignorar server_tool_use y resultados de búsqueda)
-      let text = response.content
-        .filter((block) => block.type === "text")
-        .map((block) => block.text)
-        .join("\n");
-
-      // Limpieza defensiva de markdown residual
-      text = text
+      let text = res.content
+        .filter(b => b.type === "text")
+        .map(b => b.text)
+        .join("\n")
         .replace(/^```html\s*/im, "")
         .replace(/^```\s*/im, "")
         .replace(/```\s*$/im, "")
         .trim();
 
-      console.log(`✅ Claude respondió con web search (intento ${attempt})`);
+      console.log(`✅ OK (intento ${attempt})`);
       return text;
 
-    } catch (error) {
-      console.error(`❌ Error intento ${attempt}/${retries}: ${error.message}`);
-      if (attempt === retries) throw new Error(`Claude falló tras ${retries} intentos: ${error.message}`);
-      console.log(`⏳ Esperando 15s antes de reintentar...`);
-      await new Promise(resolve => setTimeout(resolve, 15000));
+    } catch (err) {
+      console.error(`❌ Intento ${attempt}: ${err.message}`);
+      if (attempt === retries) throw err;
+      // Backoff exponencial: 30s, 60s, 120s
+      const wait = 30000 * Math.pow(2, attempt - 1);
+      console.log(`⏳ Esperando ${wait / 1000}s...`);
+      await new Promise(r => setTimeout(r, wait));
     }
   }
 }
 
 // ============================================================
-// ENVÍO DE EMAIL
+// EMAIL
 // ============================================================
 
-async function sendEmail(subject, htmlContent) {
-  try {
-    const result = await resend.emails.send({
-      from: FROM,
-      to: RECIPIENT,
-      subject: subject,
-      html: wrapEmailHTML(subject, htmlContent),
-    });
-    console.log(`✅ Email enviado: ${subject} | ID: ${result.data?.id}`);
-    return result;
-  } catch (error) {
-    console.error(`❌ Error enviando email: ${error.message}`);
-    throw error;
-  }
-}
-
-function wrapEmailHTML(title, content) {
+function wrapHTML(title, content) {
   const fecha = new Date().toLocaleDateString("es-ES", {
     weekday: "long", year: "numeric", month: "long", day: "numeric"
   });
-
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 640px; margin: 0 auto; padding: 20px; background: #f9f9f7; color: #1a1a1a;">
-  <div style="background: white; border-radius: 12px; padding: 28px; border: 0.5px solid #e5e5e0;">
-
-    <div style="border-bottom: 1px solid #f0f0ec; padding-bottom: 16px; margin-bottom: 24px;">
-      <p style="margin: 0 0 4px; font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.08em;">Quality Growth Portfolio</p>
-      <h1 style="margin: 0 0 4px; font-size: 20px; font-weight: 500; color: #1a1a1a;">${title}</h1>
-      <p style="margin: 0; font-size: 12px; color: #aaa;">${fecha}</p>
-    </div>
-
-    ${content}
-
-    <div style="border-top: 1px solid #f0f0ec; padding-top: 16px; margin-top: 24px;">
-      <p style="margin: 0; font-size: 11px; color: #bbb; line-height: 1.5;">
-        Agente Quality Growth v2.3 · Datos en tiempo real con web search · No es asesoramiento financiero
-      </p>
-    </div>
-
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:620px;margin:0 auto;padding:20px;background:#f9f9f7;color:#1a1a1a;">
+<div style="background:white;border-radius:12px;padding:24px;border:0.5px solid #e5e5e0;">
+  <div style="border-bottom:1px solid #f0f0ec;padding-bottom:14px;margin-bottom:20px;">
+    <p style="margin:0 0 3px;font-size:10px;color:#999;text-transform:uppercase;letter-spacing:0.08em;">Quality Growth Portfolio</p>
+    <h1 style="margin:0 0 3px;font-size:19px;font-weight:500;">${title}</h1>
+    <p style="margin:0;font-size:11px;color:#bbb;">${fecha}</p>
   </div>
-</body>
-</html>`;
+  ${content}
+  <div style="border-top:1px solid #f0f0ec;padding-top:14px;margin-top:20px;">
+    <p style="margin:0;font-size:10px;color:#ccc;">Quality Growth Agent v2.4 · Web search activo · No es asesoramiento financiero</p>
+  </div>
+</div></body></html>`;
+}
+
+async function sendEmail(subject, html) {
+  const result = await resend.emails.send({
+    from: FROM, to: RECIPIENT, subject,
+    html: wrapHTML(subject, html),
+  });
+  console.log(`📧 Enviado: ${subject} | ${result.data?.id}`);
 }
 
 // ============================================================
-// RADAR SEMANAL — LUNES 8:00
+// RADAR SEMANAL — dividido en 3 llamadas pequeñas
+// para no superar el rate limit de 30k tokens/min
 // ============================================================
 
 async function weeklyRadar() {
-  console.log("📡 Generando radar semanal (lunes)...");
+  console.log("📡 Radar semanal...");
 
-  const prompt = `
-${INVESTOR_PROFILE}
+  // Llamada 1: Macro + Earnings (prompt corto)
+  const p1 = `${PROFILE}
+${FMT}
+Genera HTML para email con DOS secciones:
 
-${HTML_INSTRUCTION}
+<h2>📊 Macro de la semana</h2>
+Busca en web 2-3 eventos macro esta semana (Fed, BCE, empleo, PMI) relevantes para esta cartera. Formato: evento | día | impacto.
 
-Es lunes por la mañana. Usa web search para obtener datos reales y genera el RADAR SEMANAL.
-Busca precios actuales, máximos de 52 semanas y noticias recientes de todas las empresas.
+<h2>📅 Earnings próximos (21 días)</h2>
+Busca qué empresas de cartera o watchlist presentan resultados en 21 días. Fecha, consenso EPS, métrica clave. Si no hay ninguna, indícalo.`;
 
-SECCIÓN 1 — MACRO DE LA SEMANA
-2-3 eventos macroeconómicos de esta semana (Fed, BCE, empleo, PMI, aranceles) que afecten a estas posiciones.
-Formato: evento | día | impacto esperado en la cartera.
+  // Llamada 2: Watchlist A (4 empresas — agente)
+  const p2 = `${FMT}
+Busca en web el precio actual y máximo 52 semanas de: ASML, V (Visa), NVO (Novo Nordisk), ADYEN.
+Genera HTML de una sección con cabecera azul oscuro (#1E3A5F, texto blanco):
+"🔍 Radar del agente — oportunidades detectadas"
+Para cada empresa: precio actual real | máx 52s real | % descuento calculado | estado (🟢 si supera umbral / 🟡 cerca / ⚪ sin señal).
+Umbrales: ASML≥25% V≥20% NVO≥25% ADYEN≥30%.
+Una línea de contexto con novedades de la semana si las hay.
+Usa fondo #F0FDF4 con borde verde para 🟢, #FFF8E1 con borde naranja para 🟡, #F8FAFC para ⚪.`;
 
-SECCIÓN 2 — EARNINGS PRÓXIMOS (21 días)
-Busca qué empresas de cartera Y watchlist presentan resultados en los próximos 21 días.
-Para cada una: fecha exacta, consenso EPS/revenue, métricas clave a seguir.
+  // Llamada 3: Watchlist B (6 empresas — inversor)
+  const p3 = `${FMT}
+Busca en web el precio actual y máximo 52 semanas de: MA (Mastercard), SPGI (S&P Global), MCO (Moody's), MELI (MercadoLibre), RACE (Ferrari), ITX (Inditex BME).
+Genera HTML de una sección con cabecera verde oscuro (#1A3A1A, texto blanco):
+"📋 Tu seguimiento — estado semanal"
+Para cada empresa: precio actual real | máx 52s real | % descuento calculado | estado (🟢 si supera umbral / 🟡 cerca / ⚪ sin señal).
+Umbrales: MA≥15% SPGI≥20% MCO≥15% MELI≥30% RACE≥30% ITX≥20%.
+Una línea de contexto con novedades si las hay.
+Usa fondo #F0FDF4 con borde verde para 🟢, #FFF8E1 con borde naranja para 🟡, #F8FAFC para ⚪.`;
 
-SECCIÓN 3 — ALERTA PRINCIPAL DE LA SEMANA
-El único evento más importante a vigilar esta semana para esta cartera. Muy concreto.
+  console.log("📡 Paso 1/3: Macro + Earnings...");
+  const s1 = await askClaude(p1, 1200);
 
-SECCIÓN 4A — WATCHLIST GRUPO A: PROPUESTAS DEL AGENTE
-Cabecera con fondo #1E3A5F texto blanco. Título: "🔍 Radar del agente — oportunidades detectadas"
-Empresas: ASML, V, NVO, ADYEN
-Para cada una busca en web el precio actual real y el máximo de 52 semanas real:
-- Precio actual | Máximo 52s | % descuento calculado
-- Estado: 🟢 OPORTUNIDAD (≥umbral objetivo) | 🟡 Cerca | ⚪ Sin señal
-- Descuentos objetivo: ASML ≥25% | V ≥20% | NVO ≥25% | ADYEN ≥30%
-- Una línea de contexto con novedades de la semana
+  // Esperar 45s entre llamadas para respetar el rate limit
+  console.log("⏳ Pausa 45s entre llamadas (rate limit)...");
+  await new Promise(r => setTimeout(r, 45000));
 
-SECCIÓN 4B — WATCHLIST GRUPO B: SEGUIMIENTO DEL INVERSOR
-Cabecera con fondo #1A3A1A texto blanco. Título: "📋 Tu seguimiento — estado semanal"
-Empresas: MA, SPGI, MCO, MELI, RACE, ITX
-Para cada una busca en web el precio actual real y el máximo de 52 semanas real:
-- Precio actual | Máximo 52s | % descuento calculado
-- Estado: 🟢 OPORTUNIDAD (≥umbral objetivo) | 🟡 Cerca | ⚪ Sin señal
-- Descuentos objetivo: MA ≥15% | SPGI ≥20% | MCO ≥15% | MELI ≥30% | RACE ≥30% | ITX ≥20%
-- Una línea de contexto con novedades
+  console.log("📡 Paso 2/3: Watchlist A (agente)...");
+  const s2 = await askClaude(p2, 1200);
 
-SECCIÓN 5 — ACCIÓN RECOMENDADA
-Con presupuesto 200-300€/mes disponible a partir de julio 2026:
-¿Hay oportunidad clara ahora? → empresa concreta + precio máximo de entrada + razón.
-Si no → cuál posición de cartera priorizar.
+  console.log("⏳ Pausa 45s...");
+  await new Promise(r => setTimeout(r, 45000));
 
-Colores: oportunidad activa #F0FDF4 borde #22C55E | aviso #FFF8E1 borde #F59E0B | riesgo #FEF2F2 borde #EF4444
-Usa datos reales de web search. NUNCA inventes precios.
-`;
+  console.log("📡 Paso 3/3: Watchlist B (inversor)...");
+  const s3 = await askClaude(p3, 1200);
 
-  const content = await askClaude(prompt, 3000);
-  await sendEmail("📡 Radar semanal — Quality Growth", content);
+  const combined = `
+${s1}
+<div style="margin:20px 0;border-top:1px solid #f0f0ec;"></div>
+${s2}
+<div style="margin:20px 0;border-top:1px solid #f0f0ec;"></div>
+${s3}
+<div style="margin:20px 0;border-top:1px solid #f0f0ec;"></div>
+<div style="background:#F8FAFC;border-radius:8px;padding:14px;font-size:13px;color:#555;">
+  <strong>💡 Recuerda:</strong> Presupuesto 200-300€/mes disponible desde julio 2026. Revisa las oportunidades 🟢 antes de la próxima aportación.
+</div>`;
+
+  await sendEmail("📡 Radar semanal — Quality Growth", combined);
 }
 
 // ============================================================
-// REVISIÓN SEMANAL — VIERNES 20:00
+// REVISIÓN SEMANAL — VIERNES 20:00 (2 llamadas)
 // ============================================================
 
 async function weeklyReview() {
-  console.log("📊 Generando revisión semanal (viernes)...");
+  console.log("📊 Revisión semanal...");
 
-  const prompt = `
-${INVESTOR_PROFILE}
+  const portList = PORTFOLIO.map(p => `${p.ticker}(compra:${p.avg}${p.cur})`).join(", ");
 
-${HTML_INSTRUCTION}
+  const p1 = `${FMT}
+Busca en web el precio actual de cierre de hoy de estas acciones: ${portList}.
+Genera HTML con:
+<h2>📈 Cartera — precios y PyG</h2>
+Tabla con columnas: Empresa | Precio compra | Precio actual | PyG% | Var. semanal%
+Calcula con los precios reales que encuentres. Fondo #F0FDF4 en filas con PyG positiva, #FEF2F2 en negativa.
 
-Es viernes por la tarde. Usa web search para precios reales de cierre de hoy.
-Genera la REVISIÓN SEMANAL:
+<h2>📰 Noticias relevantes</h2>
+Las 2-3 noticias más importantes esta semana para empresas en cartera. Solo lo que importa para la tesis de largo plazo.`;
 
-SECCIÓN 1 — PRECIOS Y PyG ACTUALIZADA
-Busca el precio actual real de CADA posición de la cartera.
-Tabla HTML: Empresa | Precio compra | Precio actual (real) | PyG % | Var. semanal %
-Fondo verde (#F0FDF4) en PyG positiva, rojo (#FEF2F2) en PyG negativa.
+  const p2 = `${FMT}
+Busca en web el precio actual de: MA, SPGI, MCO, MELI, RACE, ITX, ASML, V, NVO, ADYEN.
+Genera HTML con:
+<h2>👁 Watchlist — novedades</h2>
+Dos subsecciones (A: agente / B: inversor). Solo menciona las que tengan novedad relevante esta semana. Para el resto, una línea con "sin novedad relevante".
 
-SECCIÓN 2 — NOTICIAS RELEVANTES
-Las 2-3 noticias más importantes de la semana para empresas en cartera. Solo lo relevante para tesis LP.
+<h2>🎯 Acción recomendada</h2>
+Con presupuesto 200-300€/mes disponible desde jul-2026: ¿hay oportunidad clara? Empresa concreta + precio máximo de entrada + razón en 2 frases. Si no: qué posición de cartera priorizar.`;
 
-SECCIÓN 3 — POSICIÓN DE LA SEMANA
-La posición con movimiento más relevante. ¿Cambia algo en la tesis Quality Growth?
+  console.log("📊 Paso 1/2: Cartera + noticias...");
+  const s1 = await askClaude(p1, 1400);
 
-SECCIÓN 4 — WATCHLIST NOVEDADES (Grupos A y B separados visualmente)
-Estado rápido. Solo las que tengan novedad relevante esta semana.
+  console.log("⏳ Pausa 45s...");
+  await new Promise(r => setTimeout(r, 45000));
 
-SECCIÓN 5 — ACCIÓN PARA LA SEMANA QUE VIENE
-Una recomendación concreta: empresa + precio máximo de entrada o acción en cartera.
-`;
+  console.log("📊 Paso 2/2: Watchlist + acción...");
+  const s2 = await askClaude(p2, 1200);
 
-  const content = await askClaude(prompt, 3000);
-  await sendEmail("📊 Revisión semanal — Quality Growth", content);
+  await sendEmail("📊 Revisión semanal — Quality Growth", `${s1}<div style="margin:20px 0;border-top:1px solid #f0f0ec;"></div>${s2}`);
 }
 
 // ============================================================
@@ -406,26 +263,22 @@ Una recomendación concreta: empresa + precio máximo de entrada o acción en ca
 // ============================================================
 
 async function earningsAlert() {
-  console.log("🔔 Verificando earnings próximos...");
+  console.log("🔔 Earnings alert...");
 
-  const prompt = `
-${INVESTOR_PROFILE}
+  const all = [
+    ...PORTFOLIO.map(p => p.ticker),
+    ...WATCHLIST_A.map(w => w.ticker),
+    ...WATCHLIST_B.map(w => w.ticker),
+  ].join(", ");
 
-${HTML_INSTRUCTION}
+  const prompt = `${FMT}
+Busca en web earnings en los próximos 14 días para: ${all}.
+Si HAY: genera HTML con fecha exacta, consenso EPS/revenue, métricas clave para tesis Quality Growth.
+Si NO hay ninguno: responde solo con el texto: NO_EARNINGS`;
 
-Busca en web si alguna empresa de la cartera O de la watchlist presenta resultados en los próximos 14 días.
-
-CARTERA: ${PORTFOLIO.map(p => p.ticker).join(", ")}
-WATCHLIST A: ${WATCHLIST_AGENT.map(w => w.ticker).join(", ")}
-WATCHLIST B: ${WATCHLIST_INVESTOR.map(w => w.ticker).join(", ")}
-
-Si HAY earnings: fecha exacta, consenso EPS/revenue, métricas clave para la tesis QG.
-Si NO hay ninguno en 14 días: responde ÚNICAMENTE con el texto: NO_EARNINGS
-`;
-
-  const content = await askClaude(prompt, 1500);
+  const content = await askClaude(prompt, 1200);
   if (content.trim().startsWith("NO_EARNINGS")) {
-    console.log("ℹ️ Sin earnings próximos. No se envía email.");
+    console.log("ℹ️ Sin earnings. No se envía email.");
     return;
   }
   await sendEmail("🔔 Earnings próximos — Quality Growth", content);
@@ -436,48 +289,45 @@ Si NO hay ninguno en 14 días: responde ÚNICAMENTE con el texto: NO_EARNINGS
 // ============================================================
 
 async function runManualTest(type = "radar") {
-  console.log(`🧪 Ejecutando test manual: ${type}`);
+  console.log(`🧪 Test: ${type}`);
   try {
-    switch (type) {
-      case "radar":    await weeklyRadar();   break;
-      case "review":   await weeklyReview();  break;
-      case "earnings": await earningsAlert(); break;
-      default:         await weeklyRadar();
-    }
-    console.log("✅ Test completado.");
+    if (type === "radar")    await weeklyRadar();
+    else if (type === "review")   await weeklyReview();
+    else if (type === "earnings") await earningsAlert();
+    else await weeklyRadar();
+    console.log("✅ Test OK");
   } catch (err) {
-    console.error("❌ Error en test:", err);
+    console.error("❌ Error:", err.message);
   }
 }
 
 // ============================================================
-// CRON JOBS (UTC — Madrid verano = UTC+2)
+// CRON — UTC (Madrid verano = UTC+2)
 // ============================================================
 
-console.log("🚀 Quality Growth Portfolio Agent v2.3 iniciado");
-console.log(`📧 Informes a: ${RECIPIENT}`);
-console.log("📅 Lunes 8h (radar) | Viernes 20h (revisión) | Mar+Jue 9h (earnings)");
-console.log("🌐 Web search NATIVO: ACTIVO — precios en tiempo real");
+console.log("🚀 Quality Growth Agent v2.4 iniciado");
+console.log(`📧 → ${RECIPIENT}`);
+console.log("📅 Lunes 8h | Viernes 20h | Mar+Jue 9h");
+console.log("🌐 Web search ACTIVO | Rate limit: llamadas divididas con pausa 45s");
 
-async function safeRun(fn, name) {
+const safeRun = async (fn, name) => {
   try { await fn(); }
-  catch (err) { console.error(`❌ Error en tarea "${name}": ${err.message}`); }
-}
+  catch (e) { console.error(`❌ ${name}: ${e.message}`); }
+};
 
-cron.schedule("0 6 * * 1",   () => safeRun(weeklyRadar,   "weeklyRadar"),   { timezone: "UTC" });
-cron.schedule("0 18 * * 5",  () => safeRun(weeklyReview,  "weeklyReview"),  { timezone: "UTC" });
-cron.schedule("0 7 * * 2,4", () => safeRun(earningsAlert, "earningsAlert"), { timezone: "UTC" });
+cron.schedule("0 6 * * 1",   () => safeRun(weeklyRadar,   "radar"),    { timezone: "UTC" });
+cron.schedule("0 18 * * 5",  () => safeRun(weeklyReview,  "review"),   { timezone: "UTC" });
+cron.schedule("0 7 * * 2,4", () => safeRun(earningsAlert, "earnings"), { timezone: "UTC" });
 
 // ============================================================
 // ARRANQUE
-// Railway: añade RUN_ON_START=test-radar en Variables
+// Railway: RUN_ON_START=test-radar en Variables
 // Local:   node agent.js test-radar | test-review | test-earnings
 // ============================================================
 
 const arg = process.argv[2] || process.env.RUN_ON_START;
-if (arg && arg.startsWith("test-")) {
+if (arg?.startsWith("test-")) {
   setTimeout(() => runManualTest(arg.replace("test-", "")), 2000);
 } else {
-  console.log("ℹ️  Modo espera. Cron jobs activos.");
-  console.log("💡 Test: añade RUN_ON_START=test-radar en Railway → Variables");
+  console.log("ℹ️ Modo espera. Cron activo.");
 }
